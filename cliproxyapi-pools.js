@@ -222,18 +222,27 @@ async function readHub(ctx, hub) {
 
 function formatResetCountdown(date, nowMillis) {
   const remainingMillis = date.getTime() - nowMillis;
-  if (remainingMillis < 1000) return "Resets now";
+  if (remainingMillis < 1000) return "now";
 
   const totalMinutes = Math.ceil(remainingMillis / 60_000);
   const days = Math.floor(totalMinutes / 1440);
   const hours = Math.floor(totalMinutes / 60) % 24;
   const minutes = totalMinutes % 60;
-  const duration = [[days, "d"], [hours, "h"], [minutes, "m"]]
+  return [[days, "d"], [hours, "h"], [minutes, "m"]]
     .filter(([amount]) => amount > 0)
     .slice(0, 2)
     .map(([amount, unit]) => `${amount}${unit}`)
     .join(" ");
-  return `Resets in ${duration}`;
+}
+
+function resetZoneLabel(date, timeZone) {
+  if (timeZone === "Asia/Kolkata" || timeZone === "Asia/Calcutta") return "IST";
+  const offset = -date.getTimezoneOffset();
+  if (offset === 0) return "UTC";
+  const hours = Math.floor(Math.abs(offset) / 60);
+  const minutes = Math.abs(offset) % 60;
+  const fractionalHour = minutes ? `:${String(minutes).padStart(2, "0")}` : "";
+  return `UTC${offset < 0 ? "-" : "+"}${hours}${fractionalHour}`;
 }
 
 function resetDetailFields(resetsAt, timeZone, nowMillis) {
@@ -242,8 +251,8 @@ function resetDetailFields(resetsAt, timeZone, nowMillis) {
   const [month, day, hour, minute] = [
     date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(),
   ].map((part) => String(part).padStart(2, "0"));
-  const zone = timeZone === "Asia/Kolkata" || timeZone === "Asia/Calcutta" ? "IST" : timeZone;
-  return { secondaryValue: `${formatResetCountdown(date, nowMillis)} · ${month}-${day} ${hour}:${minute} ${zone}` };
+  const zone = resetZoneLabel(date, timeZone);
+  return { secondaryValue: `${hour}:${minute} ${zone} · ${formatResetCountdown(date, nowMillis)} · ${month}-${day}` };
 }
 
 function quotaPace({ resetsAt, windowMinutes, usedPercent }, nowMillis) {
@@ -277,7 +286,7 @@ function visibleDetailRows(rows) {
     : rows;
 }
 
-function detailSections({ hub, accounts, error }, ctx, nowMillis) {
+function detailSections({ hub, accounts, error }, ctx, nowMillis, showUsed) {
   if (error) return [{ title: hub.name, rows: [{ label: "Quota", value: error }] }];
 
   const rows = [];
@@ -294,11 +303,15 @@ function detailSections({ hub, accounts, error }, ctx, nowMillis) {
       continue;
     }
     for (const [period, window] of Object.entries(account.windows)) {
+      const percent = showUsed ? window.usedPercent : 100 - window.usedPercent;
+      const pace = quotaPace(window, nowMillis);
+      // CodexBar compares the marker and fill as consumed fractions, so show the target as text for remaining quota.
+      const target = !showUsed && pace !== undefined ? ` · target ${Math.round((1 - pace) * 100)}%` : "";
       addRow({
         label: `${label} · ${periods[period].label}`,
-        value: `${Math.round(100 - window.usedPercent)}% left`,
-        progress: window.usedPercent / 100,
-        pace: quotaPace(window, nowMillis),
+        value: `${Math.round(percent)}% ${showUsed ? "used" : "left"}${target}`,
+        progress: percent / 100,
+        pace: showUsed ? pace : undefined,
         ...resetDetailFields(window.resetsAt, ctx.env.timeZone, nowMillis),
       }, period === "fable");
     }
@@ -339,13 +352,15 @@ defineProvider({
   settings: [
     ...hubs.map((hub) => ({ key: hub.setting, title: `${hub.name} hub URL`, subtitle: hub.origin, type: "plain" })),
     { key: "MANAGEMENT_KEY", title: "Management key", subtitle: "The shared management password for both local proxy panels", type: "secure" },
+    { key: "QUOTA_BARS", title: "Quota bars", subtitle: "Enter remaining (default) or used.", type: "plain" },
   ],
   async fetchUsage(ctx) {
     requireLocalOrigins(ctx);
     const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub)));
     const extraWindows = readings.flatMap(averageWindows);
     const nowMillis = ctx.date.nowMillis();
-    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis));
+    const showUsed = ctx.settings.get("QUOTA_BARS")?.trim().toLowerCase() === "used";
+    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis, showUsed));
     const hasUsage = extraWindows.length > 0 || readings.some(({ accounts }) => accounts.some(({ spend }) => spend));
     if (!hasUsage) {
       const errors = details.map(({ title, rows }) => `${title} (${rows[0].value})`);
