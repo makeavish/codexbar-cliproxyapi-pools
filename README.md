@@ -6,6 +6,8 @@ When reported, account rows also show the Fable-only weekly limit, Claude's mont
 
 Set **Quota bars** to `remaining` (the default) or `used` in the plugin settings. Remaining mode shows the pace target in the label. Used mode follows CodexBar's **Show pace** setting for the bar marker.
 
+Set **Account labels** to `email` to show addresses from CLIProxyAPI. Leave it blank for numbered accounts, including when sharing your screen.
+
 ## Install
 
 Run two local CLIProxyAPI instances with enabled OAuth accounts and the same management key. Tested on macOS with CodexBar 0.84.0. [CLIProxyAPI management API](https://help.router-for.me/management/api)

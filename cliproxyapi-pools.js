@@ -198,7 +198,14 @@ async function readAccount(ctx, hub, account) {
   return spend || Object.keys(windows).length > 0 ? { windows, spend } : { error: "Quota windows unavailable" };
 }
 
-async function readHub(ctx, hub) {
+function accountEmail(credential) {
+  if (typeof credential.email !== "string") return null;
+  const email = credential.email.trim();
+  if (email.length > 120 || /[\p{Cc}\p{Cf}]/u.test(email)) return null;
+  return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email) ? email : null;
+}
+
+async function readHub(ctx, hub, showEmails) {
   const response = await readProxyResponse(() => ctx.http.get(`${hub.origin}${managementPath}auth-files`, {
     timeoutSeconds: requestTimeout,
   }));
@@ -216,7 +223,11 @@ async function readHub(ctx, hub) {
   if (accounts.size === 0) return { hub, accounts: [], error: "No enabled OAuth accounts" };
 
   const sorted = [...accounts.keys()].sort();
-  const readings = await Promise.all(sorted.map((id) => readAccount(ctx, hub, accounts.get(id))));
+  const readings = await Promise.all(sorted.map(async (id) => {
+    const credential = accounts.get(id);
+    const reading = await readAccount(ctx, hub, credential);
+    return showEmails ? { ...reading, email: accountEmail(credential) } : reading;
+  }));
   return { hub, accounts: readings };
 }
 
@@ -292,12 +303,18 @@ function detailSections({ hub, accounts, error }, ctx, nowMillis, showUsed) {
   const rows = [];
   const standardRows = [];
   const extraRows = [];
+  const identityRows = [];
   function addRow(row, extra = false) {
     rows.push(row);
     (extra ? extraRows : standardRows).push(row);
   }
   for (const [index, account] of accounts.entries()) {
     const label = `Account ${index + 1}`;
+    if (account.email) {
+      const identityRow = { label, value: account.email };
+      rows.push(identityRow);
+      identityRows.push(identityRow);
+    }
     if (account.error) {
       addRow({ label, value: account.error });
       continue;
@@ -318,11 +335,12 @@ function detailSections({ hub, accounts, error }, ctx, nowMillis, showUsed) {
     if (account.spend) addRow(spendRow(label, account.spend, ctx, nowMillis), true);
   }
 
-  if (rows.length <= maxDetailRows || extraRows.length === 0) {
+  if (rows.length <= maxDetailRows || rows.length === standardRows.length) {
     return [{ title: hub.name, rows: visibleDetailRows(rows) }];
   }
   return [
     { title: hub.name, rows: visibleDetailRows(standardRows) },
+    { title: `${hub.name} accounts`, rows: visibleDetailRows(identityRows) },
     { title: `${hub.name} extra limits`, rows: visibleDetailRows(extraRows) },
   ].filter((section) => section.rows.length > 0);
 }
@@ -353,20 +371,22 @@ defineProvider({
     ...hubs.map((hub) => ({ key: hub.setting, title: `${hub.name} hub URL`, subtitle: hub.origin, type: "plain" })),
     { key: "MANAGEMENT_KEY", title: "Management key", subtitle: "The shared management password for both local proxy panels", type: "secure" },
     { key: "QUOTA_BARS", title: "Quota bars", subtitle: "Enter remaining (default) or used.", type: "plain" },
+    { key: "ACCOUNT_LABELS", title: "Account labels", subtitle: "Enter email to show addresses, or leave blank for account numbers.", type: "plain" },
   ],
   async fetchUsage(ctx) {
     requireLocalOrigins(ctx);
-    const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub)));
+    const showEmails = ctx.settings.get("ACCOUNT_LABELS")?.trim().toLowerCase() === "email";
+    const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub, showEmails)));
     const extraWindows = readings.flatMap(averageWindows);
     const nowMillis = ctx.date.nowMillis();
     const showUsed = ctx.settings.get("QUOTA_BARS")?.trim().toLowerCase() === "used";
-    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis, showUsed));
     const hasUsage = extraWindows.length > 0 || readings.some(({ accounts }) => accounts.some(({ spend }) => spend));
     if (!hasUsage) {
-      const errors = details.map(({ title, rows }) => `${title} (${rows[0].value})`);
+      const errors = readings.map(({ hub, accounts, error }) => `${hub.name} (${error ?? accounts[0].error})`);
       throw ctx.fail.providerUnavailable(`Quota unavailable for ${errors.join(" and ")}.`);
     }
 
+    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis, showUsed));
     const snapshot = { extraWindows, details, dataConfidence: "percentOnly" };
     if (ctx.env.supportsMenuBarItems === true) {
       snapshot.menuBarItems = hubs.flatMap((hub) => {
