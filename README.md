@@ -6,6 +6,8 @@ When reported, account rows also show the Fable-only weekly limit, Claude's mont
 
 Set **Quota bars** to `remaining` (the default) or `used` in the plugin settings. Remaining mode shows the pace target in the label. Used mode follows CodexBar's **Show pace** setting for the bar marker.
 
+Set **Reset times** to `countdown`, `clock`, or `both` (the default).
+
 Set **Account labels** to `email` to show addresses from CLIProxyAPI. Leave it blank for numbered accounts, including when sharing your screen.
 
 ## Install

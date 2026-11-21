@@ -256,14 +256,29 @@ function resetZoneLabel(date, timeZone) {
   return `UTC${offset < 0 ? "-" : "+"}${hours}${fractionalHour}`;
 }
 
-function resetDetailFields(resetsAt, timeZone, nowMillis) {
+function resetDetailFields(resetsAt, ctx, nowMillis, style) {
   if (!resetsAt) return {};
   const date = new Date(resetsAt);
-  const [month, day, hour, minute] = [
-    date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(),
-  ].map((part) => String(part).padStart(2, "0"));
-  const zone = resetZoneLabel(date, timeZone);
-  return { secondaryValue: `${hour}:${minute} ${zone} · ${formatResetCountdown(date, nowMillis)} · ${month}-${day}` };
+  if (style !== "clock") {
+    const duration = formatResetCountdown(date, nowMillis);
+    const countdown = duration === "now" ? "now" : `in ${duration}`;
+    if (style === "countdown") return { secondaryValue: `Resets ${countdown}` };
+    return { secondaryValue: `${resetClock(date, ctx.env.timeZone)} · ${countdown}` };
+  }
+
+  const clock = resetClock(date, ctx.env.timeZone);
+  const day = date.toDateString();
+  const now = new Date(nowMillis);
+  if (day === now.toDateString()) return { secondaryValue: `Resets ${clock}` };
+  now.setDate(now.getDate() + 1);
+  const dateLabel = day === now.toDateString() ? "tomorrow" : ctx.format.monthDay(date);
+  return { secondaryValue: `Resets ${dateLabel}, ${clock}` };
+}
+
+function resetClock(date, timeZone) {
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  return `${hour}:${minute} ${resetZoneLabel(date, timeZone)}`;
 }
 
 function quotaPace({ resetsAt, windowMinutes, usedPercent }, nowMillis) {
@@ -275,10 +290,10 @@ function quotaPace({ resetsAt, windowMinutes, usedPercent }, nowMillis) {
   return (duration - remaining) / duration;
 }
 
-function spendRow(accountLabel, spend, ctx, nowMillis) {
+function spendRow(accountLabel, spend, format, resetFields) {
   const formatAmount = spend.currency
-    ? (amount) => ctx.format.currency(amount, spend.currency)
-    : (amount) => ctx.format.number(amount, { maximumFractionDigits: 2 });
+    ? (amount) => format.currency(amount, spend.currency)
+    : (amount) => format.number(amount, { maximumFractionDigits: 2 });
   const unit = spend.currency ? "" : " credits";
   const cap = `${formatAmount(spend.limit)}${unit}`;
   const hasUsage = spend.used !== undefined;
@@ -287,7 +302,7 @@ function spendRow(accountLabel, spend, ctx, nowMillis) {
     label: `${accountLabel} · ${spend.currency ? "Monthly spend" : "Monthly credits"}`,
     value: hasUsage ? `${used} / ${cap}` : `${cap} cap`,
     ...(hasUsage ? { progress: Math.min(1, spend.used / spend.limit) } : {}),
-    ...resetDetailFields(spend.resetsAt, ctx.env.timeZone, nowMillis),
+    ...resetFields(spend.resetsAt),
   };
 }
 
@@ -297,7 +312,7 @@ function visibleDetailRows(rows) {
     : rows;
 }
 
-function detailSections({ hub, accounts, error }, ctx, nowMillis, showUsed) {
+function detailSections({ hub, accounts, error }, { format, nowMillis, showUsed, resetFields }) {
   if (error) return [{ title: hub.name, rows: [{ label: "Quota", value: error }] }];
 
   const rows = [];
@@ -329,10 +344,10 @@ function detailSections({ hub, accounts, error }, ctx, nowMillis, showUsed) {
         value: `${Math.round(percent)}% ${showUsed ? "used" : "left"}${target}`,
         progress: percent / 100,
         pace: showUsed ? pace : undefined,
-        ...resetDetailFields(window.resetsAt, ctx.env.timeZone, nowMillis),
+        ...resetFields(window.resetsAt),
       }, period === "fable");
     }
-    if (account.spend) addRow(spendRow(label, account.spend, ctx, nowMillis), true);
+    if (account.spend) addRow(spendRow(label, account.spend, format, resetFields), true);
   }
 
   if (rows.length <= maxDetailRows || rows.length === standardRows.length) {
@@ -372,21 +387,28 @@ defineProvider({
     { key: "MANAGEMENT_KEY", title: "Management key", subtitle: "The shared management password for both local proxy panels", type: "secure" },
     { key: "QUOTA_BARS", title: "Quota bars", subtitle: "Enter remaining (default) or used.", type: "plain" },
     { key: "ACCOUNT_LABELS", title: "Account labels", subtitle: "Enter email to show addresses, or leave blank for account numbers.", type: "plain" },
+    { key: "RESET_TIMES", title: "Reset times", subtitle: "Enter countdown, clock, or both (default).", type: "plain" },
   ],
   async fetchUsage(ctx) {
     requireLocalOrigins(ctx);
     const showEmails = ctx.settings.get("ACCOUNT_LABELS")?.trim().toLowerCase() === "email";
     const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub, showEmails)));
     const extraWindows = readings.flatMap(averageWindows);
-    const nowMillis = ctx.date.nowMillis();
-    const showUsed = ctx.settings.get("QUOTA_BARS")?.trim().toLowerCase() === "used";
     const hasUsage = extraWindows.length > 0 || readings.some(({ accounts }) => accounts.some(({ spend }) => spend));
     if (!hasUsage) {
       const errors = readings.map(({ hub, accounts, error }) => `${hub.name} (${error ?? accounts[0].error})`);
       throw ctx.fail.providerUnavailable(`Quota unavailable for ${errors.join(" and ")}.`);
     }
 
-    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis, showUsed));
+    const nowMillis = ctx.date.nowMillis();
+    const resetStyle = ctx.settings.get("RESET_TIMES")?.trim().toLowerCase();
+    const display = {
+      format: ctx.format,
+      nowMillis,
+      showUsed: ctx.settings.get("QUOTA_BARS")?.trim().toLowerCase() === "used",
+      resetFields: (resetsAt) => resetDetailFields(resetsAt, ctx, nowMillis, resetStyle),
+    };
+    const details = readings.flatMap((reading) => detailSections(reading, display));
     const snapshot = { extraWindows, details, dataConfidence: "percentOnly" };
     if (ctx.env.supportsMenuBarItems === true) {
       snapshot.menuBarItems = hubs.flatMap((hub) => {
