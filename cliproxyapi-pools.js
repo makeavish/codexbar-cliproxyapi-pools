@@ -24,14 +24,20 @@ const hubs = [
   },
 ];
 
-const periods = {
+const standardPeriods = {
   session: { label: "5-hour", minutes: 300 },
   weekly: { label: "Weekly", minutes: 10080 },
   monthly: { label: "Monthly", minutes: 43200 },
 };
+const codexPeriods = Object.keys(standardPeriods);
+const periods = {
+  ...standardPeriods,
+  fable: { label: "Fable only", minutes: 10080 },
+};
 
 const managementPath = "/v0/management/";
 const requestTimeout = 6;
+const maxDetailRows = 24;
 
 function requireLocalOrigins(ctx) {
   for (const hub of hubs) {
@@ -66,12 +72,16 @@ async function readProxyResponse(send) {
   }
 }
 
-function setWindow(windows, key, percent, resetMillis) {
+function resetTimestamp(resetMillis) {
+  return new Date(resetMillis).toJSON();
+}
+
+function setWindow(windows, key, percent, resetMillis, windowMinutes = periods[key].minutes) {
   if (!Number.isFinite(percent)) return;
-  const reset = new Date(resetMillis);
   windows[key] = {
     usedPercent: Math.max(0, Math.min(100, percent)),
-    resetsAt: Number.isFinite(reset.getTime()) ? reset.toISOString() : null,
+    resetsAt: resetTimestamp(resetMillis),
+    windowMinutes,
   };
 }
 
@@ -87,20 +97,81 @@ function codexWindows(value, account) {
     if (!Number.isFinite(window?.used_percent)) continue;
     const minutes = window.limit_window_seconds / 60;
     const key = minutes > 0
-      ? Object.keys(periods).find((period) => periods[period].minutes === minutes)
+      ? codexPeriods.find((period) => periods[period].minutes === minutes)
       : fallback;
     if (!key) continue;
     const reset = Number.isFinite(window.reset_at) ? window.reset_at * 1000 : NaN;
-    setWindow(windows, key, window.used_percent, reset);
+    setWindow(windows, key, window.used_percent, reset, minutes > 0 ? minutes : null);
   }
   return windows;
 }
 
+function parseResetDate(value) {
+  return typeof value === "string" ? Date.parse(value) : NaN;
+}
+
 function claudeWindows(value) {
   const windows = {};
-  setWindow(windows, "session", value.five_hour?.utilization, Date.parse(value.five_hour?.resets_at));
-  setWindow(windows, "weekly", value.seven_day?.utilization, Date.parse(value.seven_day?.resets_at));
+  setWindow(windows, "session", value.five_hour?.utilization, parseResetDate(value.five_hour?.resets_at));
+  setWindow(windows, "weekly", value.seven_day?.utilization, parseResetDate(value.seven_day?.resets_at));
+
+  const fable = Array.isArray(value.limits) && value.limits.find((limit) => {
+    const modelName = limit?.scope?.model?.display_name;
+    return limit?.kind === "weekly_scoped" && limit.group === "weekly"
+      && Number.isFinite(limit.percent) && typeof modelName === "string"
+      && /^fable(?:\s+\d+(?:\.\d+)*)?$/i.test(modelName.trim());
+  });
+  if (fable) setWindow(windows, "fable", fable.percent, parseResetDate(fable.resets_at));
   return windows;
+}
+
+function isSpendAmount(value) {
+  return Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+}
+
+function claudeSpendCap(value) {
+  const { is_enabled: enabled, used_credits: used, monthly_limit: limit, currency } = value.extra_usage ?? {};
+  if (enabled !== true || !isSpendAmount(used) || !isSpendAmount(limit) || limit < 1) return null;
+  const code = (typeof currency === "string" && currency.trim().toUpperCase()) || "USD";
+  if (!/^[A-Z]{3}$/.test(code)) return null;
+  // Claude's OAuth usage endpoint reports both amounts in hundredths of the currency.
+  return { used: used / 100, limit: limit / 100, currency: code };
+}
+
+function codexCreditAmount(value) {
+  const decimal = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+  const amount = typeof value === "string" && decimal.test(value.trim()) ? Number(value) : value;
+  return isSpendAmount(amount) ? amount : undefined;
+}
+
+function codexSpendCap(value) {
+  for (const container of [value, value.rate_limit, value.spend_control, value.spendControl]) {
+    const cap = container?.individual_limit ?? container?.individualLimit;
+    const limit = codexCreditAmount(cap?.limit);
+    if (!(limit > 0)) continue;
+
+    let used = codexCreditAmount(cap.used);
+    let estimated = false;
+    if (used === undefined) {
+      let usedPercent = codexCreditAmount(cap.used_percent ?? cap.usedPercent);
+      if (usedPercent === undefined) {
+        const remainingPercent = codexCreditAmount(cap.remaining_percent ?? cap.remainingPercent);
+        if (remainingPercent <= 100) usedPercent = 100 - remainingPercent;
+      }
+      if (usedPercent <= 100) {
+        used = limit * usedPercent / 100;
+        estimated = true;
+      }
+    }
+    const resetSeconds = codexCreditAmount(cap.reset_at ?? cap.resets_at ?? cap.resetsAt);
+    return {
+      used,
+      estimated,
+      limit,
+      resetsAt: Number.isInteger(resetSeconds) && resetSeconds > 0 ? resetTimestamp(resetSeconds * 1000) : null,
+    };
+  }
+  return null;
 }
 
 async function readAccount(ctx, hub, account) {
@@ -121,8 +192,10 @@ async function readAccount(ctx, hub, account) {
 
   const quota = parseJSON(body);
   if (!quota) return { error: "Invalid quota response" };
-  const windows = hub.id === "codex" ? codexWindows(quota, account) : claudeWindows(quota);
-  return Object.keys(windows).length > 0 ? { windows } : { error: "Quota windows unavailable" };
+  const isCodex = hub.id === "codex";
+  const windows = isCodex ? codexWindows(quota, account) : claudeWindows(quota);
+  const spend = isCodex ? codexSpendCap(quota) : claudeSpendCap(quota);
+  return spend || Object.keys(windows).length > 0 ? { windows, spend } : { error: "Quota windows unavailable" };
 }
 
 async function readHub(ctx, hub) {
@@ -163,38 +236,90 @@ function formatResetCountdown(date, nowMillis) {
   return `Resets in ${duration}`;
 }
 
-function formatResetDetails(resetsAt, timeZone, nowMillis) {
+function resetDetailFields(resetsAt, timeZone, nowMillis) {
+  if (!resetsAt) return {};
   const date = new Date(resetsAt);
   const [month, day, hour, minute] = [
     date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(),
   ].map((part) => String(part).padStart(2, "0"));
   const zone = timeZone === "Asia/Kolkata" || timeZone === "Asia/Calcutta" ? "IST" : timeZone;
-  return `${formatResetCountdown(date, nowMillis)} · ${month}-${day} ${hour}:${minute} ${zone}`;
+  return { secondaryValue: `${formatResetCountdown(date, nowMillis)} · ${month}-${day} ${hour}:${minute} ${zone}` };
 }
 
-function detailSection({ hub, accounts, error }, timeZone, nowMillis) {
-  if (error) return { title: hub.name, rows: [{ label: "Quota", value: error }] };
+function quotaPace({ resetsAt, windowMinutes, usedPercent }, nowMillis) {
+  if (!resetsAt || !(windowMinutes > 0)) return undefined;
+  const duration = windowMinutes * 60_000;
+  const remaining = Date.parse(resetsAt) - nowMillis;
+  if (!(remaining > 0) || remaining > duration) return undefined;
+  if (remaining === duration && usedPercent > 0) return undefined;
+  return (duration - remaining) / duration;
+}
 
-  const rows = accounts.flatMap((account, index) => {
-    const label = `Account ${index + 1}`;
-    if (account.error) return [{ label, value: account.error }];
-    return Object.entries(account.windows).map(([period, window]) => ({
-      label: `${label} · ${periods[period].label}`,
-      value: `${Math.round(100 - window.usedPercent)}% left`,
-      progress: window.usedPercent / 100,
-      ...(window.resetsAt ? { secondaryValue: formatResetDetails(window.resetsAt, timeZone, nowMillis) } : {}),
-    }));
-  });
-  const visibleRows = rows.length > 24
-    ? [...rows.slice(0, 23), { label: "Details", value: "Additional rows hidden" }]
+function spendRow(accountLabel, spend, ctx, nowMillis) {
+  const formatAmount = spend.currency
+    ? (amount) => ctx.format.currency(amount, spend.currency)
+    : (amount) => ctx.format.number(amount, { maximumFractionDigits: 2 });
+  const unit = spend.currency ? "" : " credits";
+  const cap = `${formatAmount(spend.limit)}${unit}`;
+  const hasUsage = spend.used !== undefined;
+  const used = hasUsage ? `${spend.estimated ? "~" : ""}${formatAmount(spend.used)}` : null;
+  return {
+    label: `${accountLabel} · ${spend.currency ? "Monthly spend" : "Monthly credits"}`,
+    value: hasUsage ? `${used} / ${cap}` : `${cap} cap`,
+    ...(hasUsage ? { progress: Math.min(1, spend.used / spend.limit) } : {}),
+    ...resetDetailFields(spend.resetsAt, ctx.env.timeZone, nowMillis),
+  };
+}
+
+function visibleDetailRows(rows) {
+  return rows.length > maxDetailRows
+    ? [...rows.slice(0, maxDetailRows - 1), { label: "Details", value: "Additional rows hidden" }]
     : rows;
-  return { title: hub.name, rows: visibleRows };
+}
+
+function detailSections({ hub, accounts, error }, ctx, nowMillis) {
+  if (error) return [{ title: hub.name, rows: [{ label: "Quota", value: error }] }];
+
+  const rows = [];
+  const standardRows = [];
+  const extraRows = [];
+  function addRow(row, extra = false) {
+    rows.push(row);
+    (extra ? extraRows : standardRows).push(row);
+  }
+  for (const [index, account] of accounts.entries()) {
+    const label = `Account ${index + 1}`;
+    if (account.error) {
+      addRow({ label, value: account.error });
+      continue;
+    }
+    for (const [period, window] of Object.entries(account.windows)) {
+      addRow({
+        label: `${label} · ${periods[period].label}`,
+        value: `${Math.round(100 - window.usedPercent)}% left`,
+        progress: window.usedPercent / 100,
+        pace: quotaPace(window, nowMillis),
+        ...resetDetailFields(window.resetsAt, ctx.env.timeZone, nowMillis),
+      }, period === "fable");
+    }
+    if (account.spend) addRow(spendRow(label, account.spend, ctx, nowMillis), true);
+  }
+
+  if (rows.length <= maxDetailRows || extraRows.length === 0) {
+    return [{ title: hub.name, rows: visibleDetailRows(rows) }];
+  }
+  return [
+    { title: hub.name, rows: visibleDetailRows(standardRows) },
+    { title: `${hub.name} extra limits`, rows: visibleDetailRows(extraRows) },
+  ].filter((section) => section.rows.length > 0);
 }
 
 function averageWindows({ hub, accounts }) {
-  return Object.entries(periods).flatMap(([key, period]) => {
+  const keys = hub.id === "codex" ? codexPeriods : Object.keys(periods);
+  return keys.flatMap((key) => {
     const windows = accounts.map((account) => account.windows?.[key]).filter(Boolean);
     if (windows.length === 0) return [];
+    const period = periods[key];
     const usedPercent = windows.reduce((sum, window) => sum + window.usedPercent, 0) / windows.length;
     return [{
       id: `${hub.id}-${key}`,
@@ -220,8 +345,9 @@ defineProvider({
     const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub)));
     const extraWindows = readings.flatMap(averageWindows);
     const nowMillis = ctx.date.nowMillis();
-    const details = readings.map((reading) => detailSection(reading, ctx.env.timeZone, nowMillis));
-    if (extraWindows.length === 0) {
+    const details = readings.flatMap((reading) => detailSections(reading, ctx, nowMillis));
+    const hasUsage = extraWindows.length > 0 || readings.some(({ accounts }) => accounts.some(({ spend }) => spend));
+    if (!hasUsage) {
       const errors = details.map(({ title, rows }) => `${title} (${rows[0].value})`);
       throw ctx.fail.providerUnavailable(`Quota unavailable for ${errors.join(" and ")}.`);
     }

@@ -2,6 +2,8 @@
 
 See how much quota each Codex and Claude account has left, when it resets, and how long until then. Reset times use your Mac's time zone. The pool view averages the reported percentages, with equal weight per account.
 
+When reported, account rows also show the Fable-only weekly limit, Claude's monthly spend cap, and Codex's monthly credit cap. Turn on CodexBar's **Show pace** setting for pace markers on quota bars with a known reset and duration.
+
 ## Install
 
 Run two local CLIProxyAPI instances with enabled OAuth accounts and the same management key. Tested on macOS with CodexBar 0.84.0. [CLIProxyAPI management API](https://help.router-for.me/management/api)
