@@ -20,7 +20,8 @@ const hubs = [
     usageURL: "https://api.anthropic.com/api/oauth/usage",
     headers: {
       "anthropic-beta": "oauth-2025-04-20",
-      "User-Agent": "claude-code/2.1.273",
+      // Claude's usage endpoint gates saved reset inventory on the client version.
+      "User-Agent": "claude-code/2.1.330",
     },
   },
 ];
