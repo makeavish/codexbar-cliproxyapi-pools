@@ -5,6 +5,7 @@ const hubs = [
     setting: "CODEX_URL",
     origin: "http://127.0.0.1:8317",
     usageURL: "https://chatgpt.com/backend-api/wham/usage",
+    resetCreditsURL: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
     headers: {
       "OpenAI-Beta": "codex-1",
       Originator: "Codex Desktop",
@@ -38,6 +39,8 @@ const periods = {
 const managementPath = "/v0/management/";
 const requestTimeout = 6;
 const maxDetailRows = 24;
+const maxResetCredits = 50;
+const maxResetRecords = 200;
 
 function requireLocalOrigins(ctx) {
   for (const hub of hubs) {
@@ -174,17 +177,71 @@ function codexSpendCap(value) {
   return null;
 }
 
+function creditDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    ? parseResetDate(value)
+    : NaN;
+}
+
+function savedResetCredits(hub, payload, nowMillis) {
+  const isCodex = hub.id === "codex";
+  const records = isCodex ? payload?.credits : payload?.cedar_ember?.grants;
+  if (!Array.isArray(records) || records.length > maxResetRecords) return null;
+  if (!isCodex && payload.cedar_ember.eligible !== true) return null;
+
+  let count = 0;
+  let nextExpiry = Infinity;
+  for (const record of records) {
+    const remaining = isCodex ? 1 : record?.resets_left;
+    if (isCodex) {
+      if (record?.status !== "available") continue;
+    } else {
+      if (record?.paused !== false || !Number.isInteger(remaining) || remaining <= 0) continue;
+      const total = record.resets_total;
+      if (total != null && (!Number.isInteger(total) || total < remaining)) continue;
+      if (record.starts_at != null && !(creditDate(record.starts_at) <= nowMillis)) continue;
+    }
+
+    const bound = isCodex ? record.expires_at : record.ends_at;
+    const expiry = bound == null ? Infinity : creditDate(bound);
+    if (!(expiry > nowMillis)) continue;
+    count += remaining;
+    if (count > maxResetCredits) return null;
+    nextExpiry = Math.min(nextExpiry, expiry);
+  }
+  return count > 0 ? { count, nextExpiry: resetTimestamp(nextExpiry) } : null;
+}
+
+function proxyGet(ctx, hub, account, url, headers, timeoutSeconds = requestTimeout) {
+  return readProxyResponse(() => ctx.http.post(`${hub.origin}${managementPath}api-call`, {
+    timeoutSeconds,
+    body: { auth_index: account.auth_index, method: "GET", url, header: headers },
+  }));
+}
+
 async function readAccount(ctx, hub, account) {
+  const isCodex = hub.id === "codex";
   const headers = { Authorization: "Bearer $TOKEN$", ...hub.headers };
   const workspaceId = account.id_token?.chatgpt_account_id;
   if (hub.id === "codex" && typeof workspaceId === "string" && /^[A-Za-z0-9_-]+$/.test(workspaceId)) {
     headers["Chatgpt-Account-Id"] = workspaceId;
   }
 
-  const response = await readProxyResponse(() => ctx.http.post(`${hub.origin}${managementPath}api-call`, {
-    timeoutSeconds: requestTimeout,
-    body: { auth_index: account.auth_index, method: "GET", url: hub.usageURL, header: headers },
-  }));
+  let response;
+  if (isCodex) {
+    response = await proxyGet(ctx, hub, account, hub.usageURL, headers);
+  } else {
+    const inventoryHeaders = {
+      ...headers,
+      "User-Agent": headers["User-Agent"].replace("claude-code/", "claude-cli/") + " (external, cli)",
+    };
+    response = await proxyGet(ctx, hub, account, `${hub.usageURL}?cedar_ember=1`, inventoryHeaders);
+    const status = response.value?.status_code;
+    const missingProfileScope = typeof response.value?.body === "string" && response.value.body.includes("user:profile");
+    if (status === 400 || (status === 403 && !missingProfileScope)) {
+      response = await proxyGet(ctx, hub, account, hub.usageURL, headers);
+    }
+  }
   if (response.error) return response;
   const { body, status_code: status } = response.value;
   if (!Number.isInteger(status)) return { error: "Invalid proxy response" };
@@ -192,10 +249,20 @@ async function readAccount(ctx, hub, account) {
 
   const quota = parseJSON(body);
   if (!quota) return { error: "Invalid quota response" };
-  const isCodex = hub.id === "codex";
   const windows = isCodex ? codexWindows(quota, account) : claudeWindows(quota);
   const spend = isCodex ? codexSpendCap(quota) : claudeSpendCap(quota);
-  return spend || Object.keys(windows).length > 0 ? { windows, spend } : { error: "Quota windows unavailable" };
+  let inventory = quota;
+  if (isCodex) {
+    const credits = await proxyGet(ctx, hub, account, hub.resetCreditsURL, {
+      ...headers, Accept: "application/json", "User-Agent": "CodexBar",
+    }, 4);
+    const status = credits.value?.status_code;
+    inventory = Number.isInteger(status) && status >= 200 && status < 300 ? parseJSON(credits.value.body) : null;
+  }
+  const resetCredits = savedResetCredits(hub, inventory, ctx.date.nowMillis());
+  return spend || resetCredits || Object.keys(windows).length > 0
+    ? { windows, spend, resetCredits }
+    : { error: "Quota windows unavailable" };
 }
 
 function accountEmail(credential) {
@@ -256,23 +323,24 @@ function resetZoneLabel(date, timeZone) {
   return `UTC${offset < 0 ? "-" : "+"}${hours}${fractionalHour}`;
 }
 
-function resetDetailFields(resetsAt, ctx, nowMillis, style) {
+function resetDetailFields(resetsAt, ctx, nowMillis, style, event = "Resets") {
   if (!resetsAt) return {};
   const date = new Date(resetsAt);
   if (style !== "clock") {
     const duration = formatResetCountdown(date, nowMillis);
     const countdown = duration === "now" ? "now" : `in ${duration}`;
-    if (style === "countdown") return { secondaryValue: `Resets ${countdown}` };
-    return { secondaryValue: `${resetClock(date, ctx.env.timeZone)} · ${countdown}` };
+    if (style === "countdown") return { secondaryValue: `${event} ${countdown}` };
+    const caption = event === "Expires" ? `exp. ${duration}` : countdown;
+    return { secondaryValue: `${resetClock(date, ctx.env.timeZone)} · ${caption}` };
   }
 
   const clock = resetClock(date, ctx.env.timeZone);
   const day = date.toDateString();
   const now = new Date(nowMillis);
-  if (day === now.toDateString()) return { secondaryValue: `Resets ${clock}` };
+  if (day === now.toDateString()) return { secondaryValue: `${event} ${clock}` };
   now.setDate(now.getDate() + 1);
   const dateLabel = day === now.toDateString() ? "tomorrow" : ctx.format.monthDay(date);
-  return { secondaryValue: `Resets ${dateLabel}, ${clock}` };
+  return { secondaryValue: `${event} ${dateLabel}, ${clock}` };
 }
 
 function resetClock(date, timeZone) {
@@ -348,6 +416,14 @@ function detailSections({ hub, accounts, error }, { format, nowMillis, showUsed,
       }, period === "fable");
     }
     if (account.spend) addRow(spendRow(label, account.spend, format, resetFields), true);
+    if (account.resetCredits) {
+      const { count, nextExpiry } = account.resetCredits;
+      addRow({
+        label: `${label} · Reset credits`,
+        value: `${count} available`,
+        ...(nextExpiry ? resetFields(nextExpiry, "Expires") : { secondaryValue: "No expiry" }),
+      }, true);
+    }
   }
 
   if (rows.length <= maxDetailRows || rows.length === standardRows.length) {
@@ -394,7 +470,8 @@ defineProvider({
     const showEmails = ctx.settings.get("ACCOUNT_LABELS")?.trim().toLowerCase() === "email";
     const readings = await Promise.all(hubs.map((hub) => readHub(ctx, hub, showEmails)));
     const extraWindows = readings.flatMap(averageWindows);
-    const hasUsage = extraWindows.length > 0 || readings.some(({ accounts }) => accounts.some(({ spend }) => spend));
+    const hasUsage = extraWindows.length > 0
+      || readings.some(({ accounts }) => accounts.some(({ spend, resetCredits }) => spend || resetCredits));
     if (!hasUsage) {
       const errors = readings.map(({ hub, accounts, error }) => `${hub.name} (${error ?? accounts[0].error})`);
       throw ctx.fail.providerUnavailable(`Quota unavailable for ${errors.join(" and ")}.`);
@@ -406,7 +483,7 @@ defineProvider({
       format: ctx.format,
       nowMillis,
       showUsed: ctx.settings.get("QUOTA_BARS")?.trim().toLowerCase() === "used",
-      resetFields: (resetsAt) => resetDetailFields(resetsAt, ctx, nowMillis, resetStyle),
+      resetFields: (resetsAt, event) => resetDetailFields(resetsAt, ctx, nowMillis, resetStyle, event),
     };
     const details = readings.flatMap((reading) => detailSections(reading, display));
     const snapshot = { extraWindows, details, dataConfidence: "percentOnly" };

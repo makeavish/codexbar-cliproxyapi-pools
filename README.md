@@ -2,7 +2,7 @@
 
 See how much quota each Codex and Claude account has left, when it resets, and how long until then. Reset times use your Mac's time zone. The pool view averages the reported percentages, with equal weight per account.
 
-When reported, account rows also show the Fable-only weekly limit, Claude's monthly spend cap, and Codex's monthly credit cap.
+When reported, account rows also show the Fable-only weekly limit, Claude's monthly spend cap, and Codex's monthly credit cap. **Reset credits** shows saved manual resets and the next expiry. Redeem them through the provider.
 
 Set **Quota bars** to `remaining` (the default) or `used` in the plugin settings. Remaining mode shows the pace target in the label. Used mode follows CodexBar's **Show pace** setting for the bar marker.
 
