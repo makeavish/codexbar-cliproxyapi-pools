@@ -42,6 +42,8 @@ const requestTimeout = 6;
 const maxDetailRows = 24;
 const maxResetCredits = 50;
 const maxResetRecords = 200;
+const defaultClaudeCooldown = 5 * 60_000;
+const claudeRetryUntil = new Map();
 
 function requireLocalOrigins(ctx) {
   for (const hub of hubs) {
@@ -220,8 +222,26 @@ function proxyGet(ctx, hub, account, url, headers, timeoutSeconds = requestTimeo
   }));
 }
 
+function claudeRetryTime(headers, now) {
+  const field = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "retry-after")?.[1];
+  const first = Array.isArray(field) ? field[0] : field;
+  const value = typeof first === "string" ? first.trim() : "";
+  const until = /^\d+$/.test(value) ? now + Number(value) * 1000 : Date.parse(value);
+  return until > now && Number.isFinite(new Date(until).getTime()) ? until : now + defaultClaudeCooldown;
+}
+
+function claudeCooldown(until, now) {
+  const wait = formatResetCountdown(new Date(until), now);
+  return { error: wait === "now" ? "Claude 429 · retry shortly" : `Claude 429 · retry in ${wait}` };
+}
+
 async function readAccount(ctx, hub, account) {
   const isCodex = hub.id === "codex";
+  if (!isCodex) {
+    const now = Date.now();
+    const until = claudeRetryUntil.get(account.auth_index);
+    if (until > now) return claudeCooldown(until, now);
+  }
   const headers = { Authorization: "Bearer $TOKEN$", ...hub.headers };
   const workspaceId = account.id_token?.chatgpt_account_id;
   if (hub.id === "codex" && typeof workspaceId === "string" && /^[A-Za-z0-9_-]+$/.test(workspaceId)) {
@@ -246,6 +266,12 @@ async function readAccount(ctx, hub, account) {
   if (response.error) return response;
   const { body, status_code: status } = response.value;
   if (!Number.isInteger(status)) return { error: "Invalid proxy response" };
+  if (!isCodex && status === 429) {
+    const now = Date.now();
+    const until = claudeRetryTime(response.value.header, now);
+    claudeRetryUntil.set(account.auth_index, until);
+    return claudeCooldown(until, now);
+  }
   if (status < 200 || status >= 300) return { error: `${hub.name} HTTP ${status}` };
 
   const quota = parseJSON(body);
@@ -287,6 +313,12 @@ async function readHub(ctx, hub, showEmails) {
     if (credential?.provider !== hub.id || credential.disabled || credential.account_type === "api_key") continue;
     if (typeof credential.auth_index !== "string" || !credential.auth_index.trim()) continue;
     accounts.set(credential.auth_index, credential);
+  }
+  if (hub.id === "claude") {
+    const now = Date.now();
+    for (const [id, until] of claudeRetryUntil) {
+      if (until <= now) claudeRetryUntil.delete(id);
+    }
   }
   if (accounts.size === 0) return { hub, accounts: [], error: "No enabled OAuth accounts" };
 
